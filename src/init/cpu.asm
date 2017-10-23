@@ -98,8 +98,7 @@ init_cpu:
 	mov eax, 0x01000000		; Set bits 31-24 for all cores to be in Group 1
 	mov dword [rsi+0xD0], eax	; Logical Destination Register
 
-	xor eax, eax
-	not eax				; Set EAX to 0xFFFFFFFF; Bits 31-28 set for Flat Mode
+	or eax, -1			; Set EAX to 0xFFFFFFFF; Bits 31-28 set for Flat Mode
 	mov dword [rsi+0xE0], eax	; Destination Format Register
 
 	mov eax, dword [rsi+0xF0]	; Spurious Interrupt Vector Register
