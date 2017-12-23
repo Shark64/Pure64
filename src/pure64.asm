@@ -9,7 +9,7 @@
 ;
 ; Pure64 requires a payload for execution! The stand-alone pure64.sys file
 ; is not sufficient. You must append your kernel or software to the end of
-; the Pure64 binary. The maximum size of the kernel or software is 26KiB.
+; the Pure64 binary. The maximum size of the kernel or software is 28KiB.
 ;
 ; Windows - copy /b pure64.sys + kernel64.sys
 ; Unix - cat pure64.sys kernel64.sys > pure64.sys
@@ -20,7 +20,7 @@
 USE32
 ORG 0x00008000
 
-PURE64SIZE	equ 4096		; Pad Pure64 to this length
+PURE64SIZE equ 4096			; Pad Pure64 to this length
 
 start:
 	jmp start32			; This command will be overwritten with 'NOP's before the AP's are started
@@ -66,7 +66,7 @@ start32:
 
 	mov edi, 0x5000			; Clear the info map
 	xor eax, eax
-	mov cx, 1024
+	mov cx, 512
 	rep stosd
 
 	xor eax, eax			; Clear all registers
@@ -77,9 +77,6 @@ start32:
 	xor edi, edi
 	xor ebp, ebp
 	mov esp, 0x8000			; Set a known free location for the stack
-	
-	mov [0x000B809C], byte '2'	; Now in 32-bit protected mode (0x20 = 32)
-	mov [0x000B809E], byte '0'
 
 ; Set up RTC
 ; Port 0x70 is RTC Address, and 0x71 is RTC Data
@@ -117,20 +114,6 @@ rtc_poll:
 	out 0x21, al
 	out 0xA1, al
 
-; Hide VGA hardware cursor
-	mov al, 0x0F			; Cursor Low Port
-	mov dx, 0x03D4
-	out dx, al
-	mov al, 0xFF
-	mov dx, 0x03D5
-	out dx, al
-	mov al, 0x0E			; Cursor High Port
-	mov dx, 0x03D4
-	out dx, al
-	mov al, 0xFF
-	mov dx, 0x03D5
-	out dx, al
-
 ; Configure serial port @ 0x03F8
 	mov dx, 0x03F9
 	mov al, 0x00			; Disable all interrupts
@@ -154,16 +137,16 @@ rtc_poll:
 	add dx, 2
 	out dx, al
 
-; Clear out the first 4096 bytes of memory. This will store the 64-bit IDT, GDT, PML4, and PDP
-	mov ecx, 1024
+; Clear out the first 20KiB of memory. This will store the 64-bit IDT, GDT, PML4, PDP Low, and PDP High
+	mov ecx, 5120
 	xor eax, eax
 	mov edi, eax
 	rep stosd
 
-; Clear memory for the Page Descriptor Entries (0x10000 - 0x4FFFF)
+; Clear memory for the Page Descriptor Entries (0x10000 - 0x5FFFF)
 	mov edi, 0x00010000
-	mov ecx, 65536
-	rep stosd
+	mov ecx, 81920
+	rep stosd			; Write 320KiB
 
 ; Copy the GDT to its final location in memory
 	mov esi, gdt64
@@ -177,13 +160,13 @@ rtc_poll:
 ; A single PML4 entry can map 512GB with 2MB pages.
 	cld
 	mov edi, 0x00002000		; Create a PML4 entry for the first 4GB of RAM
-	mov eax, 0x00003007
+	mov eax, 0x00003007		; location of low PDP
 	stosd
 	xor eax, eax
 	stosd
 
 	mov edi, 0x00002800		; Create a PML4 entry for higher half (starting at 0xFFFF800000000000)
-	mov eax, 0x00003007		; The higher half is identity mapped to the lower half
+	mov eax, 0x00004007		; location of high PDP
 	stosd
 	xor eax, eax
 	stosd
@@ -191,10 +174,10 @@ rtc_poll:
 ; Create the PDP entries.
 ; The first PDP is stored at 0x0000000000003000, create the first entries there
 ; A single PDP entry can map 1GB with 2MB pages
-	mov ecx, 64			; number of PDPE's to make.. each PDPE maps 1GB of physical memory
-	mov edi, 0x00003000
-	mov eax, 0x00010007		; location of first PD
-create_pdpe:
+	mov ecx, 4			; number of PDPE's to make.. each PDPE maps 1GB of physical memory
+	mov edi, 0x00003000		; location of low PDPE
+	mov eax, 0x00010007		; location of first low PD
+create_pdpe_low:
 	stosd
 	push eax
 	xor eax, eax
@@ -203,15 +186,27 @@ create_pdpe:
 	add eax, 0x00001000		; 4K later (512 records x 8 bytes)
 	dec ecx
 	cmp ecx, 0
-	jne create_pdpe
+	jne create_pdpe_low
 
-; Create the PD entries.
-; PD entries are stored starting at 0x0000000000010000 and ending at 0x000000000004FFFF (256 KiB)
-; This gives us room to map 64 GiB with 2 MiB pages
+	mov ecx, 64			; number of PDPE's to make.. each PDPE maps 1GB of physical memory
+	mov edi, 0x00004000		; location of high PDPE
+	mov eax, 0x00020007		; location of first high PD. Bits (0) P, 1 (R/W), and 2 (U/S) set
+create_pdpe_high:
+	stosd
+	push eax
+	xor eax, eax
+	stosd
+	pop eax
+	add eax, 0x00001000		; 4K later (512 records x 8 bytes)
+	dec ecx
+	cmp ecx, 0
+	jne create_pdpe_high
+
+; Create the low PD entries.
 	mov edi, 0x00010000
-	mov eax, 0x0000008F		; Bit 7 must be set to 1 as we have 2 MiB pages
+	mov eax, 0x0000008F		; Bits 0 (P), 1 (R/W), 2 (U/S), 3 (PWT), and 7 (PS) set
 	xor ecx, ecx
-pd_again:				; Create a 2 MiB page
+pd_low:					; Create a 2 MiB page
 	stosd
 	push eax
 	xor eax, eax
@@ -220,7 +215,7 @@ pd_again:				; Create a 2 MiB page
 	add eax, 0x00200000
 	inc ecx
 	cmp ecx, 2048
-	jne pd_again			; Create 2048 2 MiB page maps.
+	jne pd_low			; Create 2048 2 MiB page maps.
 
 ; Load the GDT
 	lgdt [GDTR64]
@@ -231,7 +226,7 @@ pd_again:				; Create a 2 MiB page
 	mov cr4, eax
 
 ; Point cr3 at PML4
-	mov eax, 0x00002008		; Write-thru (Bit 3)
+	mov eax, 0x00002008		; Write-thru enabled (Bit 3)
 	mov cr3, eax
 
 ; Enable long mode and SYSCALL/SYSRET
@@ -239,10 +234,6 @@ pd_again:				; Create a 2 MiB page
 	rdmsr				; Read EFER
 	or eax, 0x00000101 		; LME (Bit 8)
 	wrmsr				; Write EFER
-
-; Debug	
-	mov [0x000B809C], byte '1'	; About to make the jump into 64-bit mode
-	mov [0x000B809E], byte 'E'
 
 ; Enable paging to activate long mode
 	mov eax, cr0
@@ -259,10 +250,6 @@ align 16
 USE64
 
 start64:
-; Debug
-	mov [0x000B809C], byte '4'	; Now in 64-bit mode (0x40 = 64)
-	mov [0x000B809E], byte '0'
-
 	xor eax, eax			; aka r0
 	xor ebx, ebx			; aka r3
 	xor ecx, ecx			; aka r1
@@ -294,26 +281,23 @@ clearcs64:
 
 	lgdt [GDTR64]			; Reload the GDT
 
-; Debug
-	mov [0x000B809E], byte '2'
-
 ; Patch Pure64 AP code			; The AP's will be told to start execution at 0x8000
 	mov edi, start			; We need to remove the BSP Jump call to get the AP's
 	mov eax, 0x90909090		; to fall through to the AP Init code
 	stosd
 	stosb				; Write 5 bytes in total to overwrite the 'far jump'
 
-; Build the rest of the page tables (4GiB+)
-	xor ecx, ecx			; Clear the counter
-	mov rax, 0x000000010000008F
-	mov rdi, 0x0000000000014000
-buildem:
+; Create the high PD entries
+	mov rax, 0x000000000000008F	; Bits 0 (P), 1 (R/W), 2 (U/S), 3 (PWT), and 7 (PS) set
+	mov rdi, 0x0000000000020000	; Location of high PD entries
+	add rax, 0x0000000000400000	; Add 4MiB offset
+	xor ecx, ecx
+pd_high:
 	stosq
 	add rax, 0x0000000000200000
 	add rcx, 1
-	cmp rcx, 30720			; Another 60 GiB (We already mapped 4 GiB)
-	jne buildem
-	; We have 64 GiB mapped now
+	cmp rcx, 8192			; Map 16 GiB
+	jne pd_high
 
 ; Build a temporary IDT
 	xor rdi, rdi 			; create the 64-bit IDT (at linear address 0x0000000000000000)
@@ -391,9 +375,6 @@ make_interrupt_gates: 			; make gates for the other interrupts
 
 	lidt [IDTR64]			; load IDT register
 
-; Debug
-	mov [0x000B809E], byte '4'
-
 ; Clear memory 0xf000 - 0xf7ff for the infomap (2048 bytes)
 	xor rax, rax
 	mov rcx, 256
@@ -410,9 +391,6 @@ clearmapnext:
 
 	call init_pic			; Configure the PIC(s), also activate interrupts
 
-; Debug	
-	mov [0x000B809E], byte '6'	; CPU Init complete
-
 ; Init of SMP
 	call init_smp
 
@@ -425,13 +403,9 @@ clearmapnext:
 	add rax, 0x0000000000050400	; stacks decrement when you "push", start at 1024 bytes in
 	mov rsp, rax			; Pure64 leaves 0x50000-0x9FFFF free so we use that
 
-; Debug		
-	mov [0x000B809C], byte '6'	; SMP Init complete
-	mov [0x000B809E], byte '0'
-
 ; Calculate amount of usable RAM from Memory Map
 	xor rcx, rcx
-	mov rsi, 0x0000000000004000	; E820 Map location
+	mov rsi, 0x0000000000006000	; E820 Map location
 readnextrecord:
 	lodsq
 	lodsq
@@ -460,9 +434,6 @@ endmemcalc:
 	add ecx, 1			; The BIOS will usually report actual memory minus 1
 	and ecx, 0xFFFFFFFE		; Make sure it is an even number (in case we added 1 to an even number)
 	mov dword [mem_amount], ecx
-
-; Debug
-	mov [0x000B809E], byte '2'
 
 ; Build the infomap
 	xor rdi, rdi
@@ -505,20 +476,19 @@ nextIOAPIC:
 	cmp cl, 0
 	jne nextIOAPIC
 
-; Debug
-	mov [0x000B809E], byte '4'
+	mov di, 0x5080
+	mov eax, [VBEModeInfoBlock.PhysBasePtr]		; Base address of video memory (if graphics mode is set)
+	stosd
+	mov eax, [VBEModeInfoBlock.XResolution]		; X and Y resolution (16-bits each)
+	stosd
+	mov al, [VBEModeInfoBlock.BitsPerPixel]		; Color depth
+	stosb
 
 ; Move the trailing binary to its final location
 	mov rsi, 0x8000+PURE64SIZE	; Memory offset to end of pure64.sys
 	mov rdi, 0x100000		; Destination address at the 1MiB mark
 	mov rcx, ((32768 - PURE64SIZE) / 8)
 	rep movsq			; Copy 8 bytes at a time
-
-; Debug
-	mov rdi, 0x000B8090		; Clear the debug messages in the top-right corner
-	mov rax, 0x0720072007200720
-	stosq
-	stosq				; Write a total of 8 characters (2 bytes each)
 
 ; Clear all registers (skip the stack pointer)
 	xor eax, eax			; These 32-bit calls also clear the upper bits of the 64-bit registers
